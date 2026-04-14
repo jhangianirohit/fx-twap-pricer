@@ -76,11 +76,11 @@ def exercise_value(prior_A, S, k: int, N: int):
     return (N - k) / N * (prior_A - S)
 
 
-def perfect_foresight(paths: np.ndarray):
+def perfect_foresight(paths: np.ndarray, k_min: int = 1):
     n_paths, N = paths.shape
     pA = prior_avgs(paths)
     payoffs = np.zeros((n_paths, N))
-    for k in range(1, N):
+    for k in range(k_min, N):
         payoffs[:, k] = np.maximum(0.0, exercise_value(pA[:, k], paths[:, k], k, N))
     best = payoffs.max(axis=1)
     best_k = payoffs.argmax(axis=1)
@@ -88,15 +88,16 @@ def perfect_foresight(paths: np.ndarray):
     return float(best.mean()), best_k
 
 
-def longstaff_schwartz(paths: np.ndarray):
-    """Returns (premium, stop_k array, regression betas {k: beta vector})."""
+def longstaff_schwartz(paths: np.ndarray, k_min: int = 1):
+    """Returns (premium, stop_k array, regression betas {k: beta vector}).
+    k_min: earliest fixing index at which stopping is allowed (must keep ≥ k_min fixings)."""
     n_paths, N = paths.shape
     pA = prior_avgs(paths)
     cashflow = np.zeros(n_paths)
     stop_k = np.full(n_paths, N, dtype=int)  # N = never stopped
     betas: dict[int, np.ndarray] = {}
 
-    for k in range(N - 1, 0, -1):
+    for k in range(N - 1, k_min - 1, -1):
         S_k = paths[:, k]
         A_k = pA[:, k]
         ex = exercise_value(A_k, S_k, k, N)
@@ -127,11 +128,11 @@ def longstaff_schwartz(paths: np.ndarray):
 
 
 @st.cache_data(show_spinner=False)
-def price_all(S0, sigma, dt_hours, N, n_paths, seed):
+def price_all(S0, sigma, dt_hours, N, n_paths, seed, k_min=1):
     paths = simulate_paths(S0, sigma, dt_hours, N, n_paths, seed)
     heur = heuristic_premium(S0, sigma, dt_hours)
-    lsm_prem, lsm_stops, lsm_betas = longstaff_schwartz(paths)
-    pf_prem, pf_stops = perfect_foresight(paths)
+    lsm_prem, lsm_stops, lsm_betas = longstaff_schwartz(paths, k_min=k_min)
+    pf_prem, pf_stops = perfect_foresight(paths, k_min=k_min)
     return {
         "paths": paths,
         "heuristic": heur,
@@ -143,34 +144,34 @@ def price_all(S0, sigma, dt_hours, N, n_paths, seed):
     }
 
 
-def price_only(S0, sigma, dt_hours, N, n_paths, seed):
+def price_only(S0, sigma, dt_hours, N, n_paths, seed, k_min=1):
     """Used by Greek bumping (no need to keep stops/betas)."""
     paths = simulate_paths(S0, sigma, dt_hours, N, n_paths, seed)
-    lsm, _, _ = longstaff_schwartz(paths)
+    lsm, _, _ = longstaff_schwartz(paths, k_min=k_min)
     return lsm
 
 
 @st.cache_data(show_spinner=False)
-def compute_greeks(S0, sigma, dt_hours, N, n_paths, seed):
+def compute_greeks(S0, sigma, dt_hours, N, n_paths, seed, k_min=1):
     """Bump-and-reprice greeks at t=0 with common random numbers."""
-    base = price_only(S0, sigma, dt_hours, N, n_paths, seed)
+    base = price_only(S0, sigma, dt_hours, N, n_paths, seed, k_min)
 
     # Delta & gamma: bump spot by 5bps
     h_S = S0 * 5e-4
-    p_up = price_only(S0 + h_S, sigma, dt_hours, N, n_paths, seed)
-    p_dn = price_only(S0 - h_S, sigma, dt_hours, N, n_paths, seed)
+    p_up = price_only(S0 + h_S, sigma, dt_hours, N, n_paths, seed, k_min)
+    p_dn = price_only(S0 - h_S, sigma, dt_hours, N, n_paths, seed, k_min)
     delta = (p_up - p_dn) / (2 * h_S)
     gamma = (p_up - 2 * base + p_dn) / (h_S ** 2)
 
     # Vega: bump vol by 1 vol point (1%)
     h_v = 0.01
-    v_up = price_only(S0, sigma + h_v, dt_hours, N, n_paths, seed)
-    v_dn = price_only(S0, sigma - h_v, dt_hours, N, n_paths, seed)
+    v_up = price_only(S0, sigma + h_v, dt_hours, N, n_paths, seed, k_min)
+    v_dn = price_only(S0, sigma - h_v, dt_hours, N, n_paths, seed, k_min)
     vega = (v_up - v_dn) / (2 * h_v)
 
     # "Theta": value lost per fewer fixing (proxy for time decay)
-    if N > 2:
-        v_short = price_only(S0, sigma, dt_hours, N - 1, n_paths, seed)
+    if N > 2 and k_min < N - 1:
+        v_short = price_only(S0, sigma, dt_hours, N - 1, n_paths, seed, min(k_min, N - 2))
         theta_per_fix = v_short - base  # negative — option decays
     else:
         theta_per_fix = 0.0
@@ -197,13 +198,37 @@ with st.sidebar:
     notional_mm = st.number_input("Notional (mm EUR)", value=250.0, step=10.0)
 
     st.divider()
+    st.subheader("Schedule constraints")
+    start_hour = st.number_input(
+        "First fixing hour (London)", value=7.0, min_value=0.0, max_value=23.0, step=0.5,
+        help="Wall-clock time of the first fixing, used to compute the earliest-stop hour.",
+    )
+    earliest_stop_hour = st.number_input(
+        "Earliest allowed stop (London hour)", value=10.0, min_value=0.0, max_value=23.0, step=0.5,
+        help="Execution cannot end before this London hour. The 'last kept fixing' must be at or "
+             "after this time. Set equal to start_hour for no constraint.",
+    )
+    # k_min = number of fixings that MUST be kept before stopping is allowed.
+    # If first fix is at start_hour and we must keep through earliest_stop_hour:
+    #   number of fixings kept = (earliest_stop_hour - start_hour) / dt_hours + 1
+    # Stop is allowed when k (kept fixings count) ≥ k_min.
+    k_min_raw = (earliest_stop_hour - start_hour) / dt_hours + 1
+    k_min = max(1, min(int(round(k_min_raw)), N - 1))
+    if k_min_raw > N - 1:
+        st.warning(f"Earliest stop ({earliest_stop_hour:.1f}h) is past the last fixing — no stopping possible.")
+    st.caption(
+        f"→ k_min = **{k_min}** (must keep at least {k_min} fixings, "
+        f"i.e. through {start_hour + (k_min-1)*dt_hours:.1f}h London)"
+    )
+
+    st.divider()
     st.header("MC settings")
     n_paths = int(st.number_input("MC paths", value=8000, min_value=1000, step=1000))
     seed = int(st.number_input("Random seed", value=42, step=1))
 
 sigma = vol_pct / 100.0
 notional = notional_mm * 1e6
-results = price_all(spot, sigma, dt_hours, N, n_paths, seed)
+results = price_all(spot, sigma, dt_hours, N, n_paths, seed, k_min=k_min)
 
 # ============================================================
 # Header
@@ -211,7 +236,9 @@ results = price_all(spot, sigma, dt_hours, N, n_paths, seed)
 st.title("FX TWAP Optimal-Window Pricer & Risk Manager")
 st.caption(
     f"**{pair}**  ·  spot {spot:.4f}  ·  σ {vol_pct:.1f}%  ·  "
-    f"{N} fixings × {dt_hours:.1f}h  ·  notional {notional_mm:.0f}mm EUR"
+    f"{N} fixings × {dt_hours:.1f}h ({start_hour:.1f}h → {start_hour + (N-1)*dt_hours:.1f}h London)  ·  "
+    f"earliest stop {start_hour + (k_min-1)*dt_hours:.1f}h (k_min={k_min})  ·  "
+    f"notional {notional_mm:.0f}mm EUR"
 )
 
 # ============================================================
@@ -303,7 +330,7 @@ with tab_risk:
     st.subheader("Embedded option Greeks at t=0")
 
     with st.spinner("Bumping for Greeks…"):
-        greeks = compute_greeks(spot, sigma, dt_hours, N, min(n_paths, 8000), seed)
+        greeks = compute_greeks(spot, sigma, dt_hours, N, min(n_paths, 8000), seed, k_min=k_min)
 
     g1, g2, g3, g4 = st.columns(4)
     opt_delta_eur_mm = greeks["delta"] * notional / 1e6
@@ -352,10 +379,10 @@ with tab_risk:
     st.dataframe(sched, hide_index=True, use_container_width=True)
 
     st.warning(
-        f"⚠️ **Block-execution risk at stopping.** If LSM signals stop at fix τ, the bank "
+        f"⚠️ **Block-execution risk at stopping.** If LSM signals stop at fix τ ≥ {k_min}, the bank "
         f"must immediately source **(N−τ)/N × {notional_mm:.0f}mm EUR** at the prevailing "
-        f"spot. Worst case is stop at τ=1, requiring a single block trade of "
-        f"**{(N-1)/N * notional_mm:.1f}mm EUR**. Best case stop at τ=N−1 needs only "
+        f"spot. Worst case (earliest allowed stop, τ={k_min}) requires a single block trade of "
+        f"**{(N-k_min)/N * notional_mm:.1f}mm EUR**. Best case stop at τ=N−1 needs only "
         f"**{1/N * notional_mm:.1f}mm**. Operationally, work this carefully — slippage "
         f"on the block eats directly into the option premium."
     )
@@ -364,18 +391,18 @@ with tab_risk:
     st.subheader("Premium vs ATM vol")
 
     @st.cache_data(show_spinner=False)
-    def vol_scan(spot, dt_hours, N, n_paths, seed, vols_tuple):
+    def vol_scan(spot, dt_hours, N, n_paths, seed, vols_tuple, k_min):
         vols = np.array(vols_tuple)
         lsm_pts, heur_pts = [], []
         for v in vols:
-            lsm, _, _ = longstaff_schwartz(simulate_paths(spot, v, dt_hours, N, n_paths, seed))
+            lsm, _, _ = longstaff_schwartz(simulate_paths(spot, v, dt_hours, N, n_paths, seed), k_min=k_min)
             lsm_pts.append(lsm * 10000)
             heur_pts.append(heuristic_premium(spot, v, dt_hours) * 10000)
         return vols, lsm_pts, heur_pts
 
     vols = tuple(np.linspace(0.04, 0.16, 13).round(4))
     with st.spinner("Vol scan…"):
-        v_arr, lsm_pts, heur_pts = vol_scan(spot, dt_hours, N, min(n_paths, 5000), seed, vols)
+        v_arr, lsm_pts, heur_pts = vol_scan(spot, dt_hours, N, min(n_paths, 5000), seed, vols, k_min)
 
     fig3 = go.Figure()
     fig3.add_trace(go.Scatter(x=v_arr * 100, y=lsm_pts, mode="lines+markers",
@@ -403,7 +430,8 @@ with tab_decision:
 
     d1, d2, d3 = st.columns(3)
     cur_k = int(d1.number_input(
-        "Fixings completed (k)", value=N // 2, min_value=1, max_value=N - 1, step=1,
+        "Fixings completed (k)", value=max(N // 2, k_min), min_value=k_min, max_value=N - 1, step=1,
+        help=f"Bounded below by k_min={k_min} (earliest stop constraint).",
     ))
     cur_avg = d2.number_input("Running prior average", value=spot, step=0.0001, format="%.4f")
     cur_spot = d3.number_input("Current spot", value=spot * 0.998, step=0.0001, format="%.4f")
@@ -539,6 +567,23 @@ no extra position required.
 - **Block-execution risk at stopping**: when you stop at $\tau$, you must source
   $(N-\tau)/N$ × notional in one shot. This is the dominant operational risk and the
   most likely place to leak the option premium back to the market via slippage.
+
+### Schedule constraints (`k_min`)
+
+Real-world structures often impose a **minimum window** before the bank is allowed to
+stop. For example: "execution cannot end before 10am London" with a 7am first fixing
+and hourly intervals means the bank must keep at least 4 fixings (7, 8, 9, 10am) before
+stopping, i.e. $k_{\min} = 4$.
+
+This is enforced in the LSM by restricting the backward-induction to $k \ge k_{\min}$.
+The premium is monotonically decreasing in $k_{\min}$ — the client extracts value by
+constraining the bank's optionality. For typical 11-fixing parameters, moving $k_{\min}$
+from 1 to 4 costs roughly **30% of the premium**, since you forfeit the highest-leverage
+early stops where $(N-k)/N$ is largest.
+
+When quoting a client with this constraint, price unconstrained first, then with the
+constraint, and the difference is the value of the concession you're giving them. Make
+sure they know what they're getting.
 
 ### Caveats / things to extend before going live
 
